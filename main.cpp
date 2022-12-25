@@ -74,7 +74,7 @@ enum GzipFileFlags
     GZ_FCOMMENT = 0x10, //The file contains comment
 };
 
-const char* GzipFileFlags[]
+const char* GzipFileFlags[] =
 {
     "GZ_FTEXT",
     "GZ_FHCRC",
@@ -83,7 +83,7 @@ const char* GzipFileFlags[]
     "GZ_FCOMMENT"
 };
 
-const char* GzipOS[]
+const char* GzipOS[] =
 {
     "FAT filesystem (MS-DOS, OS/2, NT/Win32)",
     "Amiga",
@@ -146,7 +146,7 @@ void deflate_eat_bits(DeflateState* state, uint8_t nbits)
 }
 
 // @todo: max length!
-void deflate_peak_bytes(const DeflateState* state, const uint8_t* data, uint8_t* bytes, uint8_t nbytes)
+void deflate_peek_bytes(const DeflateState* state, const uint8_t* data, uint8_t* bytes, uint8_t nbytes)
 {
     bytes[0] = data[state->byte_id];
     if(state->bit_id > 0)
@@ -189,16 +189,16 @@ uint16_t deflate_read_nbits16(DeflateState* state, const uint8_t* data, uint8_t 
 
 struct BinaryTree
 {
-    uint8_t* data;
+    uint16_t* data;
     size_t size_data;
 };
 
 void bt_init(BinaryTree* bt)
 {
     bt->size_data = 31;
-    bt->data = (uint8_t*) malloc(bt->size_data);
+    bt->data = (uint16_t*) malloc(bt->size_data * sizeof(*bt->data));
     for(size_t i = 0; i < bt->size_data; ++i)
-        bt->data[i] = 255;
+        bt->data[i] = (uint16_t)(-1);
 }
 
 void bt_free(BinaryTree* bt)
@@ -206,19 +206,18 @@ void bt_free(BinaryTree* bt)
     free(bt->data);
 }
 
-void bt_push(BinaryTree* bt, uint8_t data, uint8_t code, uint8_t code_length)
+void bt_push(BinaryTree* bt, uint16_t data, uint8_t code, uint8_t code_length)
 {
     size_t new_size = (1 << (size_t)(code_length + 1)) - 1;
     if(new_size > bt->size_data)
     {
-        bt->data = (uint8_t*) realloc((uint8_t*) bt->data, new_size);
+        bt->data = (uint16_t*) realloc((uint16_t*) bt->data, new_size * sizeof(*bt->data));
         for(size_t i = bt->size_data; i < new_size; ++i)
-            bt->data[i] = 255;
+            bt->data[i] = (uint16_t)(-1);
         bt->size_data = new_size;
     }
 
-    //for(size_t i = 0; i < (size_t)(8 - code_length); ++i)
-    //    printf(" ");
+    //printf("%u ", data);
     //for(size_t i = 0; i < (size_t)code_length; ++i)
     //{
     //    size_t temp = code_length - i - 1;
@@ -226,35 +225,72 @@ void bt_push(BinaryTree* bt, uint8_t data, uint8_t code, uint8_t code_length)
     //}
     //printf("\n");
 
+    // Push using the reverse code.
     size_t pos = 0;
     uint8_t mask = 1 << (code_length - 1);
     for(size_t i = 0; i < (size_t)code_length; ++i)
     {
         pos = 2 * pos + 1 + ((code & mask) > 0);
         code <<= 1;
-        bt->data[pos] = 254;
+        bt->data[pos] = (uint16_t)(-2);
     }
     bt->data[pos] = data;
 }
 
-uint8_t bt_match(BinaryTree* bt, uint16_t code, uint8_t* match_length)
+uint16_t bt_match(BinaryTree* bt, uint16_t code, uint8_t* match_length)
 {
     size_t pos = 0;
     for(size_t i = 0; i < 16; ++i)
     {
         pos = 2 * pos + 1 + (code & 1);
-        if(pos >= bt->size_data || bt->data[pos] == 255)
-            return 255;
+        if(pos >= bt->size_data || bt->data[pos] == (uint16_t)(-1))
+            return (uint16_t)(-1);
         //printf("__ %lu, %d, %u\n", pos, code & 1, bt->data[pos]);
         code >>= 1;
-        if(bt->data[pos] < 254)
+        if(bt->data[pos] < (uint16_t)(-2))
         {
             *match_length = i+1;
             return bt->data[pos];
         }
     }
 
-    return 255;
+    return (uint16_t)(-1);
+}
+
+BinaryTree deflate_build_code_tree(uint8_t* code_lengths, size_t num_codes)
+{
+    size_t max_code = 0;
+    uint8_t* bl_count = (uint8_t*)calloc(16+1, 1);
+    for(size_t code = 0; code < num_codes; ++code)
+    {
+        uint8_t code_length = code_lengths[code];
+        if(code_length > 0)
+            max_code = code;
+        ++bl_count[code_length];
+    }
+
+    uint8_t code = 0;
+    uint8_t next_code[16+1];
+    for(uint8_t bits = 1; bits < 16; ++bits)
+    {
+        code = (code + bl_count[bits-1]) << 1;
+        next_code[bits] = code;
+    }
+    free(bl_count);
+
+    BinaryTree bt;
+    bt_init(&bt);
+    for(size_t n = 0;  n <= max_code; ++n)
+    {
+        uint8_t len = code_lengths[n];
+        if(len != 0)
+        {
+            bt_push(&bt, n, next_code[len], len);
+            ++next_code[len];
+        }
+    }
+
+    return bt;
 }
 
 void deflate(const uint8_t* data, size_t size)
@@ -314,10 +350,8 @@ void deflate(const uint8_t* data, size_t size)
     //                   position to the output stream.
     //          end loop
     //    while not last block
-
     static uint8_t alphabet[] = {
         16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
-      // 6,  0,  0, 7, 5, 5, 3, 5,  2, 5,  2, 5,  3, 5,  5, 0,  7,
     };
 
     printf("\n");
@@ -346,96 +380,86 @@ void deflate(const uint8_t* data, size_t size)
                 printf("%u, %u, %u\n", 257 + hlit, 1 + hdist, 4 + hclen);
 
                 printf("Reading code lengths...\n");
-                uint8_t* code_lengths = (uint8_t*) calloc(19, 1);
-                uint8_t* codes = (uint8_t*) malloc(19);
-                uint8_t max_code = 0;
+
+                // Read code lengths for code length alphabet.
+                BinaryTree bt;
                 {
-                    uint8_t bl_count[16] = {};
-                    for(uint8_t i = 0; i < hclen + 4; ++i)
-                    {
-                        uint8_t code = alphabet[i];
-                        uint8_t code_length = deflate_read_nbits8(&state, data, 3);
-                        code_lengths[code] = code_length;
-                        if(code_length > 0 && code > max_code)
-                            max_code = code;
-                        ++bl_count[code_length];
-                        printf("%u, ", code_length);
-                    }
-                    printf("\n");
+                    uint8_t num_codes = 19;
+                    size_t num_code_lengths = hclen + 4;
 
-                    bl_count[0] = 0;
-                    uint8_t code = 0;
-                    uint8_t next_code[16];
-                    for(uint8_t bits = 1; bits < 16; ++bits)
+                    // Read code lengths.
+                    uint8_t* code_lengths = (uint8_t*) calloc(num_codes, 1);
                     {
-                        code = (code + bl_count[bits-1]) << 1;
-                        next_code[bits] = code;
-                    }
-
-                    for(uint8_t n = 0;  n <= max_code; ++n)
-                    {
-                        uint8_t len = code_lengths[n];
-                        if(len != 0)
+                        for(uint8_t i = 0; i < num_code_lengths; ++i)
                         {
-                            codes[n] = next_code[len];
-                            ++next_code[len];
+                            uint8_t code = alphabet[i];
+                            uint8_t code_length = deflate_read_nbits8(&state, data, 3);
+                            code_lengths[code] = code_length;
                         }
                     }
+
+                    // Build code length Huffman tree.
+                    bt = deflate_build_code_tree(code_lengths, num_codes);
+                    free(code_lengths);
                 }
 
-                BinaryTree bt;
-                bt_init(&bt);
-
-                for(uint8_t n = 0;  n <= max_code; ++n)
-                {
-                    uint8_t len = code_lengths[n];
-                    if(len != 0)
-                    {
-                        //printf("%u\n", n);
-                        bt_push(&bt, n, codes[n], code_lengths[n]);
-                    }
-                }
-
-                free(code_lengths);
-                free(codes);
-
-                uint8_t previous_letter = 255;
-                size_t num_code_lengths = 0;
+                // Decode code lengths
                 uint8_t* alphabet_code_lengths = (uint8_t*) malloc(hlit + hdist + 258u);
-                for(size_t i = 0; i < (hlit + hdist + 258u); ++i)
+                size_t num_code_lengths = 0;
                 {
-                    uint8_t bytes[2];
-                    deflate_peak_bytes(&state, data, bytes, 2);
-                    uint8_t match_length = 0;
-                    uint8_t letter = bt_match(&bt, *(uint16_t*)bytes, &match_length);
-                    assert(letter < 254);
-                    deflate_eat_bits(&state, match_length);
-
-                    if(letter == 16)
+                    uint16_t previous_letter = (uint16_t)(-1);
+                    for(size_t i = 0; i < (hlit + hdist + 258u); ++i)
                     {
-                        uint8_t repeat = deflate_read_nbits8(&state, data, 2) + 3;
-                        letter = previous_letter;
-                        for(size_t n = 0; n < repeat; ++n)
+                        uint8_t bytes[2];
+                        deflate_peek_bytes(&state, data, bytes, 2);
+                        uint8_t match_length = 0;
+                        uint16_t letter = bt_match(&bt, *(uint16_t*)bytes, &match_length);
+                        assert(letter < (uint16_t)(-2));
+                        deflate_eat_bits(&state, match_length);
+
+                        if(letter == 16)
                         {
+                            uint8_t repeat = deflate_read_nbits8(&state, data, 2) + 3;
+                            letter = previous_letter;
+                            for(size_t n = 0; n < repeat; ++n)
+                            {
+                                alphabet_code_lengths[num_code_lengths] = (uint8_t) letter;
+                                //printf("litlen %lu %d\n", i+n, previous_letter);
+                                ++num_code_lengths;
+                            }
+                            i += repeat - 1;
+                        }
+                        else
+                        {
+                            //if(letter > 0) printf("litlen %lu %d\n", i, letter);
                             alphabet_code_lengths[num_code_lengths] = letter;
-                            //printf("litlen %lu %d\n", i+n, previous_letter);
                             ++num_code_lengths;
                         }
-                        i += repeat - 1;
-                    }
-                    else
-                    {
-                        //if(letter > 0) printf("litlen %lu %d\n", i, letter);
-                        alphabet_code_lengths[num_code_lengths] = letter;
-                        ++num_code_lengths;
-                    }
 
-                    previous_letter = letter;
+                        previous_letter = letter;
+                    }
+                    //printf("--- %lu, %u\n", num_code_lengths, hlit + hdist + 258u);
                 }
-                //printf("--- %lu, %u\n", num_code_lengths, hlit + hdist + 258u);
                 bt_free(&bt);
 
+                BinaryTree btlit  = deflate_build_code_tree(alphabet_code_lengths, hlit+257u);
+                BinaryTree btdist = deflate_build_code_tree(alphabet_code_lengths+hlit+257u, hdist+1u);
                 free(alphabet_code_lengths);
+
+                for(size_t i = 0; i < 10; ++i)
+                {
+                    uint8_t bytes[2];
+                    deflate_peek_bytes(&state, data, bytes, 2);
+                    uint8_t match_length = 0;
+                    uint16_t letter = bt_match(&btlit, *(uint16_t*)bytes, &match_length);
+                    printf("%u, %u\n", letter, match_length);
+                    assert(letter < (uint16_t)(-2));
+                    deflate_eat_bits(&state, match_length);
+
+                }
+
+                bt_free(&btlit);
+                bt_free(&btdist);
                 break;
             }
         }
