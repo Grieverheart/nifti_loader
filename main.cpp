@@ -219,13 +219,13 @@ void bt_push(BinaryTree* bt, uint16_t data, uint16_t code, uint8_t code_length)
         bt->size_data = new_size;
     }
 
-    printf("%u ", data);
-    for(size_t i = 0; i < (size_t)code_length; ++i)
-    {
-        size_t temp = code_length - i - 1;
-        printf("%d", (code & (1 << temp)) > 0);
-    }
-    printf("\n");
+    //printf("%u ", data);
+    //for(size_t i = 0; i < (size_t)code_length; ++i)
+    //{
+    //    size_t temp = code_length - i - 1;
+    //    printf("%d", (code & (1 << temp)) > 0);
+    //}
+    //printf("\n");
 
     // Push using the reverse code.
     size_t pos = 0;
@@ -358,18 +358,22 @@ void deflate(const uint8_t* data, size_t size)
     };
     static const uint16_t length_code_length_base[29] = { // size base for length codes 257..285
         3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
-        35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+        35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
+    };
     static const uint16_t length_code_extra_bits[29] = { // extra bits for length codes 257..285
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
-        3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+        3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0
+    };
     static const uint16_t dist_code_dist_base[30] = { // offset base for distance codes 0..29
         1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
         257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
-        8193, 12289, 16385, 24577};
+        8193, 12289, 16385, 24577
+    };
     static const uint16_t dist_code_extra_bits[30] = { // extra bits for distance codes 0..29
         0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
         7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
-        12, 12, 13, 13};
+        12, 12, 13, 13
+    };
 
     printf("\n");
     printf("Starting deflate...\n");
@@ -390,13 +394,13 @@ void deflate(const uint8_t* data, size_t size)
         {
             if(btype == 2)
             {
-                printf("Reading code trees...\n");
+                //printf("Reading code trees...\n");
                 uint8_t hlit  = deflate_read_nbits8(&state, data, 5);
                 uint8_t hdist = deflate_read_nbits8(&state, data, 5);
                 uint8_t hclen = deflate_read_nbits8(&state, data, 4);
-                printf("%u, %u, %u\n", 257 + hlit, 1 + hdist, 4 + hclen);
+                //printf("%u, %u, %u\n", 257 + hlit, 1 + hdist, 4 + hclen);
 
-                printf("Reading code lengths...\n");
+                //printf("Reading code lengths...\n");
 
                 // Read code lengths for code length alphabet.
                 BinaryTree bt;
@@ -456,14 +460,14 @@ void deflate(const uint8_t* data, size_t size)
                             for(size_t n = 0; n < repeat; ++n)
                             {
                                 alphabet_code_lengths[num_code_lengths] = (uint8_t) letter;
-                                printf("litlen %lu %d\n", i+n, letter);
+                                //printf("litlen %lu %d\n", i+n, letter);
                                 ++num_code_lengths;
                             }
                             i += repeat - 1;
                         }
                         else
                         {
-                            if(letter > 0) printf("litlen %lu %d\n", i, letter);
+                            //if(letter > 0) printf("litlen %lu %d\n", i, letter);
                             alphabet_code_lengths[num_code_lengths] = letter;
                             ++num_code_lengths;
                         }
@@ -489,15 +493,15 @@ void deflate(const uint8_t* data, size_t size)
 
                     if(letter == 256u)
                     {
-                        printf("end\n");
+                        //printf("end\n");
                         break;
                     }
                     else if(letter < 256u)
                     {
-                        if(letter > 32u && letter <= 126u)
-                            printf("literal '%c %u\n", letter, match_length);
-                        else
-                            printf("literal %u %u\n", letter, match_length);
+                        //if(letter > 32u && letter <= 126u)
+                        //    printf("literal '%c %u\n", letter, match_length);
+                        //else
+                        //    printf("literal %u %u\n", letter, match_length);
                     }
                     else
                     {
@@ -515,13 +519,17 @@ void deflate(const uint8_t* data, size_t size)
                         base = dist_code_dist_base[letter];
                         num_extra_bits = dist_code_extra_bits[letter];
                         uint16_t dist = base + deflate_read_nbits16(&state, data, num_extra_bits);
-                        printf("match %u %u\n", length, dist);
+                        //printf("match %u %u\n", length, dist);
                     }
 
                 }
 
                 bt_free(&btlit);
                 bt_free(&btdist);
+            }
+            else
+            {
+                assert(false);
             }
         }
 
