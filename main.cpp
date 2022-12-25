@@ -138,7 +138,7 @@ void deflate_eat_bytes(DeflateState* state, uint8_t nbytes)
 void deflate_eat_bits(DeflateState* state, uint8_t nbits)
 {
     state->bit_id += nbits;
-    if(state->bit_id >= 8)
+    while(state->bit_id >= 8)
     {
         state->bit_id -= 8;
         ++state->byte_id;
@@ -163,6 +163,8 @@ void deflate_peek_bytes(const DeflateState* state, const uint8_t* data, uint8_t*
 
 uint8_t deflate_read_nbits8(DeflateState* state, const uint8_t* data, uint8_t nbits)
 {
+    if(!nbits) return 0;
+
     uint8_t bits = data[state->byte_id] >> state->bit_id;
     if(state->bit_id > (8 - nbits))
     {
@@ -206,7 +208,7 @@ void bt_free(BinaryTree* bt)
     free(bt->data);
 }
 
-void bt_push(BinaryTree* bt, uint16_t data, uint8_t code, uint8_t code_length)
+void bt_push(BinaryTree* bt, uint16_t data, uint16_t code, uint8_t code_length)
 {
     size_t new_size = (1 << (size_t)(code_length + 1)) - 1;
     if(new_size > bt->size_data)
@@ -217,17 +219,17 @@ void bt_push(BinaryTree* bt, uint16_t data, uint8_t code, uint8_t code_length)
         bt->size_data = new_size;
     }
 
-    //printf("%u ", data);
-    //for(size_t i = 0; i < (size_t)code_length; ++i)
-    //{
-    //    size_t temp = code_length - i - 1;
-    //    printf("%d", (code & (1 << temp)) > 0);
-    //}
-    //printf("\n");
+    printf("%u ", data);
+    for(size_t i = 0; i < (size_t)code_length; ++i)
+    {
+        size_t temp = code_length - i - 1;
+        printf("%d", (code & (1 << temp)) > 0);
+    }
+    printf("\n");
 
     // Push using the reverse code.
     size_t pos = 0;
-    uint8_t mask = 1 << (code_length - 1);
+    uint16_t mask = 1 << (code_length - 1);
     for(size_t i = 0; i < (size_t)code_length; ++i)
     {
         pos = 2 * pos + 1 + ((code & mask) > 0);
@@ -264,13 +266,14 @@ BinaryTree deflate_build_code_tree(uint8_t* code_lengths, size_t num_codes)
     for(size_t code = 0; code < num_codes; ++code)
     {
         uint8_t code_length = code_lengths[code];
+        assert(code_length < 17);
         if(code_length > 0)
             max_code = code;
         ++bl_count[code_length];
     }
 
-    uint8_t code = 0;
-    uint8_t next_code[16+1];
+    uint16_t code = 0;
+    uint16_t next_code[16+1];
     for(uint8_t bits = 1; bits < 16; ++bits)
     {
         code = (code + bl_count[bits-1]) << 1;
@@ -280,10 +283,10 @@ BinaryTree deflate_build_code_tree(uint8_t* code_lengths, size_t num_codes)
 
     BinaryTree bt;
     bt_init(&bt);
-    for(size_t n = 0;  n <= max_code; ++n)
+    for(size_t n = 0; n <= max_code; ++n)
     {
         uint8_t len = code_lengths[n];
-        if(len != 0)
+        if(len > 0)
         {
             bt_push(&bt, n, next_code[len], len);
             ++next_code[len];
@@ -353,6 +356,20 @@ void deflate(const uint8_t* data, size_t size)
     static uint8_t alphabet[] = {
         16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
     };
+    static const uint16_t length_code_length_base[29] = { // size base for length codes 257..285
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+        35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static const uint16_t length_code_extra_bits[29] = { // extra bits for length codes 257..285
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+        3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static const uint16_t dist_code_dist_base[30] = { // offset base for distance codes 0..29
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+        257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+        8193, 12289, 16385, 24577};
+    static const uint16_t dist_code_extra_bits[30] = { // extra bits for distance codes 0..29
+        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+        7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
+        12, 12, 13, 13};
 
     printf("\n");
     printf("Starting deflate...\n");
@@ -446,15 +463,45 @@ void deflate(const uint8_t* data, size_t size)
                 BinaryTree btdist = deflate_build_code_tree(alphabet_code_lengths+hlit+257u, hdist+1u);
                 free(alphabet_code_lengths);
 
-                for(size_t i = 0; i < 10; ++i)
+                while(true)
                 {
                     uint8_t bytes[2];
                     deflate_peek_bytes(&state, data, bytes, 2);
                     uint8_t match_length = 0;
                     uint16_t letter = bt_match(&btlit, *(uint16_t*)bytes, &match_length);
-                    printf("%u, %u\n", letter, match_length);
                     assert(letter < (uint16_t)(-2));
                     deflate_eat_bits(&state, match_length);
+
+                    if(letter == 256u)
+                    {
+                        printf("end\n");
+                        break;
+                    }
+                    else if(letter < 256u)
+                    {
+                        if(letter > 32u && letter <= 126u)
+                            printf("literal '%c %u\n", letter, match_length);
+                        else
+                            printf("literal %u %u\n", letter, match_length);
+                    }
+                    else
+                    {
+                        letter -= 257u;
+                        uint16_t base = length_code_length_base[letter];
+                        uint16_t num_extra_bits = length_code_extra_bits[letter];
+                        uint16_t length = base + (uint16_t)deflate_read_nbits8(&state, data, num_extra_bits);
+
+                        deflate_peek_bytes(&state, data, bytes, 2);
+                        uint8_t match_length = 0;
+                        uint16_t letter = bt_match(&btdist, *(uint16_t*)bytes, &match_length);
+                        assert(letter < (uint16_t)(-2));
+                        deflate_eat_bits(&state, match_length);
+
+                        base = dist_code_dist_base[letter];
+                        num_extra_bits = dist_code_extra_bits[letter];
+                        uint16_t dist = base + deflate_read_nbits16(&state, data, num_extra_bits);
+                        printf("match %u %u\n", length, dist);
+                    }
 
                 }
 
