@@ -434,21 +434,36 @@ void deflate(const uint8_t* data, size_t size)
                         assert(letter < (uint16_t)(-2));
                         deflate_eat_bits(&state, match_length);
 
-                        if(letter == 16)
+                        if(letter >= 16)
                         {
-                            uint8_t repeat = deflate_read_nbits8(&state, data, 2) + 3;
-                            letter = previous_letter;
+                            uint8_t repeat;
+                            if(letter == 16)
+                            {
+                                repeat = deflate_read_nbits8(&state, data, 2) + 3;
+                                letter = previous_letter;
+                            }
+                            else if(letter == 17)
+                            {
+                                repeat = deflate_read_nbits8(&state, data, 3) + 3;
+                                letter = 0;
+                            }
+                            else
+                            {
+                                repeat = deflate_read_nbits8(&state, data, 7) + 11;
+                                letter = 0;
+                            }
+
                             for(size_t n = 0; n < repeat; ++n)
                             {
                                 alphabet_code_lengths[num_code_lengths] = (uint8_t) letter;
-                                //printf("litlen %lu %d\n", i+n, previous_letter);
+                                printf("litlen %lu %d\n", i+n, letter);
                                 ++num_code_lengths;
                             }
                             i += repeat - 1;
                         }
                         else
                         {
-                            //if(letter > 0) printf("litlen %lu %d\n", i, letter);
+                            if(letter > 0) printf("litlen %lu %d\n", i, letter);
                             alphabet_code_lengths[num_code_lengths] = letter;
                             ++num_code_lengths;
                         }
@@ -507,7 +522,6 @@ void deflate(const uint8_t* data, size_t size)
 
                 bt_free(&btlit);
                 bt_free(&btdist);
-                break;
             }
         }
 
