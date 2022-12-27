@@ -14,14 +14,14 @@ struct NiftiHeader
     int     extents;         // Not used; compatibility with analyze.
     short   session_error;   // Not used; compatibility with analyze.
     char    regular;         // Not used; compatibility with analyze.
-    char    dim_info;        //  Encoding directions (phase, frequency, slice).
+    char    dim_info;        // Encoding directions (phase, frequency, slice).
     short   dim[8];          // Data array dimensions.
     float   intent_p1;       // 1st intent parameter.
     float   intent_p2;       // 2nd intent parameter.
     float   intent_p3;       // 3rd intent parameter.
     short   intent_code;     // nifti intent.
-    short   datatype;        //  Data type.
-    short   bitpix;          //  Number of bits per voxel.
+    short   datatype;        // Data type.
+    short   bitpix;          // Number of bits per voxel.
     short   slice_start;     // First slice index.
     float   pixdim[8];       // Grid spacings (unit per dimension).
     float   vox_offset;      // Offset into a .nii file.
@@ -296,7 +296,55 @@ BinaryTree deflate_build_code_tree(uint8_t* code_lengths, size_t num_codes)
     return bt;
 }
 
-void deflate(const uint8_t* data, size_t size)
+struct Buffer
+{
+    uint8_t* data;
+    size_t capacity;
+    size_t count;
+};
+
+void buffer_init(Buffer* buffer, size_t initial_capacity)
+{
+    buffer->capacity = (initial_capacity > 0)? initial_capacity: 32;
+    buffer->data = (uint8_t*) malloc(buffer->capacity);
+    buffer->count = 0;
+}
+
+void buffer_append(Buffer* buffer, uint8_t data)
+{
+    if(buffer->count + 1 >= buffer->capacity)
+    {
+        buffer->capacity *= 2;
+        buffer->data = (uint8_t*) realloc(buffer->data, buffer->capacity);
+    }
+    buffer->data[buffer->count++] = data;
+}
+
+void buffer_append_v(Buffer* buffer, const uint8_t* data, size_t count)
+{
+    if(buffer->count + count >= buffer->capacity)
+    {
+        buffer->capacity = (buffer->count + count) * 2;
+        buffer->data = (uint8_t*) realloc(buffer->data, buffer->capacity);
+    }
+    memcpy(buffer->data + buffer->count, data, count);
+    buffer->count += count;
+}
+
+void buffer_resize(Buffer* buffer, uint8_t new_capacity)
+{
+    if(new_capacity < buffer->capacity) return;
+    buffer->capacity = new_capacity;
+    buffer->data = (uint8_t*) realloc(buffer->data, buffer->capacity);
+}
+
+void buffer_compact(Buffer* buffer)
+{
+    buffer->capacity = buffer->count;
+    buffer->data = (uint8_t*) realloc(buffer->data, buffer->capacity);
+}
+
+uint8_t* inflate(const uint8_t* data, size_t size, size_t* size_out)
 {
     // DEFLATE
     //
@@ -376,7 +424,10 @@ void deflate(const uint8_t* data, size_t size)
     };
 
     printf("\n");
-    printf("Starting deflate...\n");
+    printf("Starting inflate...\n");
+
+    Buffer data_buffer;
+    buffer_init(&data_buffer, size);
 
     DeflateState state;
     state.byte_id = 0;
@@ -498,6 +549,8 @@ void deflate(const uint8_t* data, size_t size)
                     }
                     else if(letter < 256u)
                     {
+                        buffer_append(&data_buffer, letter);
+                        //printf("literal 0x%x\n", letter);
                         //if(letter > 32u && letter <= 126u)
                         //    printf("literal '%c %u\n", letter, match_length);
                         //else
@@ -520,6 +573,19 @@ void deflate(const uint8_t* data, size_t size)
                         num_extra_bits = dist_code_extra_bits[letter];
                         uint16_t dist = base + deflate_read_nbits16(&state, data, num_extra_bits);
                         //printf("match %u %u\n", length, dist);
+                        const uint8_t* data_lookback = data_buffer.data + data_buffer.count - dist;
+                        if(length <= dist)
+                            buffer_append_v(&data_buffer, data_lookback, length);
+                        else
+                        {
+                            size_t l = length; 
+                            while(l >= dist)
+                            {
+                                buffer_append_v(&data_buffer, data_lookback, dist);
+                                l -= dist;
+                            }
+                            if(l > 0) buffer_append_v(&data_buffer, data_lookback, l);
+                        }
                     }
 
                 }
@@ -535,9 +601,13 @@ void deflate(const uint8_t* data, size_t size)
 
         if(bfinal) break;
     }
+
+    buffer_compact(&data_buffer);
+    *size_out = data_buffer.count;
+    return data_buffer.data;
 }
 
-void read_gzip(FILE* fp)
+uint8_t* read_gzip(FILE* fp, size_t* data_size)
 {
     fseek(fp, 0, SEEK_END);
     size_t file_size = ftell(fp);
@@ -551,28 +621,87 @@ void read_gzip(FILE* fp)
 
     // @todo: Optional headers
 
-    size_t data_size = file_size - 10 - 8;
-    uint8_t* cdata = (uint8_t*) malloc(data_size);
-    fread(cdata, data_size, 1, fp);
+    size_t cdata_size = file_size - 10 - 8;
+    uint8_t* cdata = (uint8_t*) malloc(cdata_size);
+    fread(cdata, cdata_size, 1, fp);
     uint32_t crc32, deflated_data_size;
     fread(&crc32, 4, 1, fp);
     fread(&deflated_data_size, 4, 1, fp);
 
     printf("\n");
-    printf("Data size: %f Mb\n", (data_size / 1024.0) / 1024.0);
+    printf("Data size: %f Mb\n", (cdata_size / 1024.0) / 1024.0);
     printf("Uncompressed data size: %f Mb\n", (deflated_data_size / 1024.0) / 1024.0);
-    printf("Compression ratio: %fx\n", (float)deflated_data_size / data_size);
+    printf("Compression ratio: %fx\n", (float)deflated_data_size / cdata_size);
     printf("CRC32: 0x%x\n", crc32);
 
-    deflate(cdata, data_size);
-
+    uint8_t* data = inflate(cdata, cdata_size, data_size);
     free(cdata);
+    printf("%f\n", (*data_size / 1024.0) / 1024.0);
+    uint32_t read_crc32 = CRC32(data, *data_size);
+    printf("CRC32: 0x%x\n", read_crc32);
+
+    assert(read_crc32 == crc32);
+
+    return data;
+}
+
+void print_nifti_header(NiftiHeader header)
+{
+    printf("\nNifti Header:\n");
+    printf("===========================\n");
+    printf("sizeof_hdr: %d\n", header.sizeof_hdr);
+    printf("data_type: %s\n", header.data_type);
+    printf("db_name: %s\n", header.db_name);
+    printf("extents: %d\n", header.extents);
+    printf("session_error: %d\n", header.session_error);
+    printf("regular: %d\n", header.regular);
+    printf("dim_info: %d\n", header.dim_info);
+    printf("dim: %d %d %d %d %d %d %d %d\n", header.dim[0], header.dim[1], header.dim[2], header.dim[3], header.dim[4], header.dim[5], header.dim[6], header.dim[7]);
+    printf("intent_p1: %f\n", header.intent_p1);
+    printf("intent_p2: %f\n", header.intent_p2);
+    printf("intent_p3: %f\n", header.intent_p3);
+    printf("intent_code: %d\n", header.intent_code);
+    printf("datatype: %d\n", header.datatype);
+    printf("bitpix: %d\n", header.bitpix);
+    printf("slice_start: %d\n", header.slice_start);
+    printf("pixdim: %f %f %f %f %f %f %f %f\n", header.pixdim[0], header.pixdim[1], header.pixdim[2], header.pixdim[3], header.pixdim[4], header.pixdim[5], header.pixdim[6], header.pixdim[7]);
+    printf("vox_offset: %f\n", header.vox_offset);
+    printf("scl_slope: %f\n", header.scl_slope);
+    printf("scl_inter: %f\n", header.scl_inter);
+    printf("slice_end: %d\n", header.slice_end);
+    printf("slice_code: %d\n", header.slice_code);
+    printf("xyzt_units: %d\n", header.xyzt_units);
+    printf("cal_max: %f\n", header.cal_max);
+    printf("cal_min: %f\n", header.cal_min);
+    printf("slice_duration: %f\n", header.slice_duration);
+    printf("toffset: %f\n", header.toffset);
+    printf("glmax: %d\n", header.glmax);
+    printf("glmin: %d\n", header.glmin);
+    printf("descrip: %s\n", header.descrip);
+    printf("aux_file: %s\n", header.aux_file);
+    printf("qform_code: %d\n", header.qform_code);
+    printf("sform_code: %d\n", header.sform_code);
+    printf("quatern_b: %f\n", header.quatern_b);
+    printf("quatern_c: %f\n", header.quatern_c);
+    printf("quatern_d: %f\n", header.quatern_d);
+    printf("qoffset_x: %f\n", header.qoffset_x);
+    printf("qoffset_y: %f\n", header.qoffset_y);
+    printf("qoffset_z: %f\n", header.qoffset_z);
+    printf("srow_x: %f %f %f %f\n", header.srow_x[0], header.srow_x[1], header.srow_x[2], header.srow_x[3]);
+    printf("srow_y: %f %f %f %f\n", header.srow_y[0], header.srow_y[1], header.srow_y[2], header.srow_y[3]);
+    printf("srow_z: %f %f %f %f\n", header.srow_z[0], header.srow_z[1], header.srow_z[2], header.srow_z[3]);
+    printf("intent_name: %s\n", header.intent_name);
+    printf("magic: %s\n", header.magic);
 }
 
 int main(int argc, char* argv[])
 {
     FILE* fp = fopen(argv[1], "rb");
-    read_gzip(fp);
+    size_t data_size = 0;
+    uint8_t* data = read_gzip(fp, &data_size);
+    NiftiHeader header = *(NiftiHeader*)data;
+    print_nifti_header(header);
+
     fclose(fp);
     return 0;
 }
