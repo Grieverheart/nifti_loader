@@ -78,12 +78,12 @@ enum NtNiftiTypeEnum
 
 typedef struct
 {
-    void*       voxel_data;
-    uint16_t    voxel_type;
-    uint8_t     dim;
-    size_t*     shape;
-    float       affine[4*4];
-    NtNiftiHeader header;
+    NtNiftiHeader* header;
+    void*          voxel_data;
+    uint16_t       voxel_type;
+    uint8_t        dim;
+    size_t*        shape;
+    float          affine[4*4];
 } NtNifti;
 
 extern NtNifti nt_nifti_file_read(char* filepath);
@@ -735,7 +735,7 @@ static void nti__print_nifti_header(NtNiftiHeader header)
 
 void nt_nifti_free(NtNifti* nifti)
 {
-    free(nifti->voxel_data);
+    free(nifti->header);
     free(nifti->shape);
 }
 
@@ -752,8 +752,9 @@ NtNifti nt_nifti_file_read(char* filepath)
     assert(header.sizeof_hdr == 348);
     assert(header.sform_code == 1);
     NtNifti nifti;
-    nifti.header = header;
+    nifti.header = (NtNiftiHeader*)data;
     nifti.voxel_type = header.datatype;
+    // @todo: Need to fix this. Can't free this data!
     nifti.voxel_data = (void*)(data + (size_t)header.vox_offset);
     nifti.dim = header.dim[0];
     nifti.shape = (size_t*) malloc(nifti.dim * sizeof(*nifti.shape));
