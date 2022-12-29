@@ -118,6 +118,13 @@ enum NtiGzipFileFlagsEnum
     GZ_FCOMMENT = 0x10, //The file contains comment
 };
 
+
+#ifndef NTIW_ASSERT
+#include <assert.h>
+#define NTIW_ASSERT(x) assert(x)
+#endif
+
+#if 0
 static const char* NtiGzipFileFlags[] =
 {
     "GZ_FTEXT",
@@ -150,13 +157,6 @@ static const char* NtiGzipOS[] =
     "OS/400",
     "Mac OS"
 };
-
-
-#ifndef NTIW_ASSERT
-#include <assert.h>
-#define NTIW_ASSERT(x) assert(x)
-#endif
-
 static void nti__print_gzip_header(NtiGzipHeader header)
 {
     printf("magic: 0x%x 0x%x\n", header.magic[0], header.magic[1]);
@@ -172,6 +172,7 @@ static void nti__print_gzip_header(NtiGzipHeader header)
     printf("OS id: 0x%x\n", header.os_id);
     printf("    %s\n", header.os_id < 20? NtiGzipOS[header.os_id]: "Unknown");
 }
+#endif
 
 typedef struct
 {
@@ -275,14 +276,6 @@ inline static void nti__bt_push(NtiBinaryTree* bt, uint16_t data, uint16_t code,
         bt->size_data = new_size;
     }
 
-    //printf("%u ", data);
-    //for(size_t i = 0; i < (size_t)code_length; ++i)
-    //{
-    //    size_t temp = code_length - i - 1;
-    //    printf("%d", (code & (1 << temp)) > 0);
-    //}
-    //printf("\n");
-
     // Push using the reverse code.
     size_t pos = 0;
     uint16_t mask = 1 << (code_length - 1);
@@ -303,7 +296,6 @@ inline static uint16_t nti__bt_match(NtiBinaryTree* bt, uint16_t code, uint8_t* 
         pos = 2 * pos + 1 + (code & 1);
         if(pos >= bt->size_data || bt->data[pos] == (uint16_t)(-1))
             return (uint16_t)(-1);
-        //printf("__ %lu, %d, %u\n", pos, code & 1, bt->data[pos]);
         code >>= 1;
         if(bt->data[pos] < (uint16_t)(-2))
         {
@@ -480,9 +472,6 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
         12, 12, 13, 13
     };
 
-    printf("\n");
-    printf("Starting nti__inflate...\n");
-
     NtiBuffer data_buffer;
     nti__buffer_init(&data_buffer, size);
 
@@ -497,20 +486,22 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
         uint8_t bfinal = header & 1;
         uint8_t btype  = (header >> 1) & 3;
         if(btype == 0)
+        {
             printf("No compression not supported yet.\n");
-        else if(btype == 3)
             NTIW_ASSERT(false);
+        }
+        else if(btype == 3)
+        {
+            printf("Static Huffman tables not supported yet.\n");
+            NTIW_ASSERT(false);
+        }
         else
         {
             if(btype == 2)
             {
-                //printf("Reading code trees...\n");
                 uint8_t hlit  = nti__deflate_read_nbits8(&state, 5);
                 uint8_t hdist = nti__deflate_read_nbits8(&state, 5);
                 uint8_t hclen = nti__deflate_read_nbits8(&state, 4);
-                //printf("%u, %u, %u\n", 257 + hlit, 1 + hdist, 4 + hclen);
-
-                //printf("Reading code lengths...\n");
 
                 // Read code lengths for code length alphabet.
                 NtiBinaryTree bt;
@@ -570,21 +561,18 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                             for(size_t n = 0; n < repeat; ++n)
                             {
                                 alphabet_code_lengths[num_code_lengths] = (uint8_t) letter;
-                                //printf("litlen %lu %d\n", i+n, letter);
                                 ++num_code_lengths;
                             }
                             i += repeat - 1;
                         }
                         else
                         {
-                            //if(letter > 0) printf("litlen %lu %d\n", i, letter);
                             alphabet_code_lengths[num_code_lengths] = letter;
                             ++num_code_lengths;
                         }
 
                         previous_letter = letter;
                     }
-                    //printf("--- %lu, %u\n", num_code_lengths, hlit + hdist + 258u);
                 }
                 nti__bt_free(&bt);
 
@@ -602,19 +590,9 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                     nti__deflate_eat_bits(&state, match_length);
 
                     if(letter == 256u)
-                    {
-                        //printf("end\n");
                         break;
-                    }
                     else if(letter < 256u)
-                    {
                         nti__buffer_append(&data_buffer, letter);
-                        //printf("literal 0x%x\n", letter);
-                        //if(letter > 32u && letter <= 126u)
-                        //    printf("literal '%c %u\n", letter, match_length);
-                        //else
-                        //    printf("literal %u %u\n", letter, match_length);
-                    }
                     else
                     {
                         letter -= 257u;
@@ -631,7 +609,6 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                         base = dist_code_dist_base[letter];
                         num_extra_bits = dist_code_extra_bits[letter];
                         uint16_t dist = base + nti__deflate_read_nbits16(&state, num_extra_bits);
-                        //printf("match %u %u\n", length, dist);
                         // @note: Slower
                         //size_t pos = data_buffer.count - dist;
                         //for(size_t i = 0; i < length; ++i)
@@ -680,11 +657,8 @@ static uint8_t* nti__read_gzip(FILE* fp, size_t* data_size)
     size_t file_size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
 
-    printf("File size: %lu bytes\n", file_size);
     NtiGzipHeader header;
-    printf("Reading %lu bytes of header.\n", sizeof(NtiGzipHeader));
     fread(&header, sizeof(NtiGzipHeader), 1, fp);
-    nti__print_gzip_header(header);
 
     // @todo: Optional headers
 
@@ -695,23 +669,16 @@ static uint8_t* nti__read_gzip(FILE* fp, size_t* data_size)
     fread(&crc32, 4, 1, fp);
     fread(&deflated_data_size, 4, 1, fp);
 
-    printf("\n");
-    printf("Data size: %f Mb\n", (cdata_size / 1024.0) / 1024.0);
-    printf("Uncompressed data size: %f Mb\n", (deflated_data_size / 1024.0) / 1024.0);
-    printf("Compression ratio: %fx\n", (float)deflated_data_size / cdata_size);
-    printf("CRC32: 0x%x\n", crc32);
-
     uint8_t* data = nti__inflate(cdata, cdata_size, data_size);
     free(cdata);
-    printf("%f\n", (*data_size / 1024.0) / 1024.0);
     uint32_t read_crc32 = nti__crc32(data, *data_size);
-    printf("CRC32: 0x%x\n", read_crc32);
 
     NTIW_ASSERT(read_crc32 == crc32);
 
     return data;
 }
 
+#if 0
 static void nti__print_nifti_header(NtNiftiHeader header)
 {
     printf("\nNifti Header:\n");
@@ -760,6 +727,7 @@ static void nti__print_nifti_header(NtNiftiHeader header)
     printf("intent_name: %s\n", header.intent_name);
     printf("magic: %s\n", header.magic);
 }
+#endif
 
 void nt_nifti_free(NtNifti* nifti)
 {
@@ -775,10 +743,9 @@ NtNifti nt_nifti_file_read(char* filepath)
     fclose(fp);
 
     NtNiftiHeader header = *(NtNiftiHeader*)data;
-    nti__print_nifti_header(header);
 
-    assert(header.sizeof_hdr == 348);
-    assert(header.sform_code == 1);
+    NTIW_ASSERT(header.sizeof_hdr == 348);
+    NTIW_ASSERT(header.sform_code == 1);
     NtNifti nifti;
     nifti.header = (NtNiftiHeader*)data;
     nifti.voxel_type = header.datatype;
