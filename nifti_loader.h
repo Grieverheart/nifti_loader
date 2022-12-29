@@ -177,6 +177,8 @@ typedef struct
 {
     size_t byte_id;
     uint8_t bit_id;
+    const uint8_t* data;
+    size_t size;
 } NtiDeflateState;
 
 inline static void nti__deflate_eat_bits(NtiDeflateState* state, uint8_t nbits)
@@ -189,33 +191,43 @@ inline static void nti__deflate_eat_bits(NtiDeflateState* state, uint8_t nbits)
     }
 }
 
-// @todo: max length!
-inline static void nti__deflate_peek_bytes(const NtiDeflateState* state, const uint8_t* data, uint8_t* bytes, uint8_t nbytes)
+inline static void nti__deflate_peek_bytes(const NtiDeflateState* state, uint8_t* bytes, uint8_t nbytes)
 {
-    bytes[0] = data[state->byte_id];
     if(state->bit_id > 0)
     {
-        for(uint8_t i = 0; i < nbytes; ++i)
+        for(uint8_t bi = 0; bi < nbytes; ++bi)
         {
-            bytes[i] = data[state->byte_id + i] >> state->bit_id;
-            uint8_t extension = ((uint16_t) data[state->byte_id+i+1] << 8) >> state->bit_id;
-            bytes[i] |= extension;
+            bytes[bi] = state->data[state->byte_id + bi] >> state->bit_id;
+            size_t next_byte_pos = state->byte_id + bi + 1;
+            if(next_byte_pos < state->size)
+            {
+                uint8_t extension = ((uint16_t) state->data[next_byte_pos] << 8) >> state->bit_id;
+                bytes[bi] |= extension;
+            }
+            else break;
         }
     }
-    else memcpy(bytes, data + state->byte_id, nbytes);
+    else
+    {
+        for(uint8_t bi = 0; bi < nbytes; ++bi)
+        {
+            if(state->byte_id + bi == state->size) break;
+            bytes[bi] = state->data[state->byte_id + bi];
+        }
+    }
 }
 
-inline static uint8_t nti__deflate_read_nbits8(NtiDeflateState* state, const uint8_t* data, uint8_t nbits)
+inline static uint8_t nti__deflate_read_nbits8(NtiDeflateState* state, uint8_t nbits)
 {
     if(!nbits) return 0;
 
-    uint8_t bits = data[state->byte_id] >> state->bit_id;
+    uint8_t bits = state->data[state->byte_id] >> state->bit_id;
     if(state->bit_id > (8 - nbits))
     {
         ++state->byte_id;
         int num_bits = state->bit_id - (8 - nbits);
         int bit_mask = (1 << num_bits) - 1;
-        bits |= (data[state->byte_id] & bit_mask) << (nbits - num_bits);
+        bits |= (state->data[state->byte_id] & bit_mask) << (nbits - num_bits);
     }
     state->bit_id = (state->bit_id + nbits) % 8;
     if(state->bit_id == 0) ++state->byte_id;
@@ -223,13 +235,13 @@ inline static uint8_t nti__deflate_read_nbits8(NtiDeflateState* state, const uin
     return bits & ((1 << nbits) - 1);
 }
 
-inline static uint16_t nti__deflate_read_nbits16(NtiDeflateState* state, const uint8_t* data, uint8_t nbits)
+inline static uint16_t nti__deflate_read_nbits16(NtiDeflateState* state, uint8_t nbits)
 {
     if(nbits <= 8)
-        return (uint16_t) nti__deflate_read_nbits8(state, data, nbits);
+        return (uint16_t) nti__deflate_read_nbits8(state, nbits);
 
-    uint16_t bits_a = (uint16_t) nti__deflate_read_nbits8(state, data, 8);
-    uint16_t bits_b = (uint16_t) nti__deflate_read_nbits8(state, data, nbits - 8);
+    uint16_t bits_a = (uint16_t) nti__deflate_read_nbits8(state, 8);
+    uint16_t bits_b = (uint16_t) nti__deflate_read_nbits8(state, nbits - 8);
     return bits_a | (bits_b << 8);
 }
 
@@ -381,6 +393,14 @@ inline static void nti__buffer_compact(NtiBuffer* buffer)
     buffer->data = (uint8_t*) realloc(buffer->data, buffer->capacity);
 }
 
+inline static void nti__buffer_maybe_resize(NtiBuffer* buffer, size_t count)
+{
+    if(buffer->count + count < buffer->capacity) return;
+
+    buffer->capacity = (buffer->count + count) * 2;
+    buffer->data = (uint8_t*) realloc(buffer->data, buffer->capacity);
+}
+
 inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* size_out)
 {
     // DEFLATE
@@ -469,9 +489,11 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
     NtiDeflateState state;
     state.byte_id = 0;
     state.bit_id  = 0;
+    state.data    = data;
+    state.size    = size;
     while(true)
     {
-        uint8_t header = nti__deflate_read_nbits8(&state, data, 3);
+        uint8_t header = nti__deflate_read_nbits8(&state, 3);
         uint8_t bfinal = header & 1;
         uint8_t btype  = (header >> 1) & 3;
         if(btype == 0)
@@ -483,9 +505,9 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
             if(btype == 2)
             {
                 //printf("Reading code trees...\n");
-                uint8_t hlit  = nti__deflate_read_nbits8(&state, data, 5);
-                uint8_t hdist = nti__deflate_read_nbits8(&state, data, 5);
-                uint8_t hclen = nti__deflate_read_nbits8(&state, data, 4);
+                uint8_t hlit  = nti__deflate_read_nbits8(&state, 5);
+                uint8_t hdist = nti__deflate_read_nbits8(&state, 5);
+                uint8_t hclen = nti__deflate_read_nbits8(&state, 4);
                 //printf("%u, %u, %u\n", 257 + hlit, 1 + hdist, 4 + hclen);
 
                 //printf("Reading code lengths...\n");
@@ -502,7 +524,7 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                         for(uint8_t i = 0; i < num_code_lengths; ++i)
                         {
                             uint8_t code = alphabet[i];
-                            uint8_t code_length = nti__deflate_read_nbits8(&state, data, 3);
+                            uint8_t code_length = nti__deflate_read_nbits8(&state, 3);
                             code_lengths[code] = code_length;
                         }
                     }
@@ -520,7 +542,7 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                     for(size_t i = 0; i < (hlit + hdist + 258u); ++i)
                     {
                         uint8_t bytes[2];
-                        nti__deflate_peek_bytes(&state, data, bytes, 2);
+                        nti__deflate_peek_bytes(&state, bytes, 2);
                         uint8_t match_length = 0;
                         uint16_t letter = nti__bt_match(&bt, *(uint16_t*)bytes, &match_length);
                         NTIW_ASSERT(letter < (uint16_t)(-2));
@@ -531,17 +553,17 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                             uint8_t repeat;
                             if(letter == 16)
                             {
-                                repeat = nti__deflate_read_nbits8(&state, data, 2) + 3;
+                                repeat = nti__deflate_read_nbits8(&state, 2) + 3;
                                 letter = previous_letter;
                             }
                             else if(letter == 17)
                             {
-                                repeat = nti__deflate_read_nbits8(&state, data, 3) + 3;
+                                repeat = nti__deflate_read_nbits8(&state, 3) + 3;
                                 letter = 0;
                             }
                             else
                             {
-                                repeat = nti__deflate_read_nbits8(&state, data, 7) + 11;
+                                repeat = nti__deflate_read_nbits8(&state, 7) + 11;
                                 letter = 0;
                             }
 
@@ -573,7 +595,7 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                 while(true)
                 {
                     uint8_t bytes[2];
-                    nti__deflate_peek_bytes(&state, data, bytes, 2);
+                    nti__deflate_peek_bytes(&state, bytes, 2);
                     uint8_t match_length = 0;
                     uint16_t letter = nti__bt_match(&btlit, *(uint16_t*)bytes, &match_length);
                     NTIW_ASSERT(letter < (uint16_t)(-2));
@@ -598,9 +620,9 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                         letter -= 257u;
                         uint16_t base = length_code_length_base[letter];
                         uint16_t num_extra_bits = length_code_extra_bits[letter];
-                        uint16_t length = base + (uint16_t)nti__deflate_read_nbits8(&state, data, num_extra_bits);
+                        uint16_t length = base + (uint16_t)nti__deflate_read_nbits8(&state, num_extra_bits);
 
-                        nti__deflate_peek_bytes(&state, data, bytes, 2);
+                        nti__deflate_peek_bytes(&state, bytes, 2);
                         uint8_t match_length = 0;
                         uint16_t letter = nti__bt_match(&btdist, *(uint16_t*)bytes, &match_length);
                         NTIW_ASSERT(letter < (uint16_t)(-2));
@@ -608,10 +630,16 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
 
                         base = dist_code_dist_base[letter];
                         num_extra_bits = dist_code_extra_bits[letter];
-                        uint16_t dist = base + nti__deflate_read_nbits16(&state, data, num_extra_bits);
+                        uint16_t dist = base + nti__deflate_read_nbits16(&state, num_extra_bits);
                         //printf("match %u %u\n", length, dist);
+                        // @note: Slower
+                        //size_t pos = data_buffer.count - dist;
+                        //for(size_t i = 0; i < length; ++i)
+                        //    nti__buffer_append(&data_buffer, data_buffer.data[pos + i % dist]);
+
+                        nti__buffer_maybe_resize(&data_buffer, length);
                         const uint8_t* data_lookback = data_buffer.data + data_buffer.count - dist;
-                        if(length <= dist)
+                        if(length < dist)
                             nti__buffer_append_v(&data_buffer, data_lookback, length);
                         else
                         {
@@ -754,7 +782,6 @@ NtNifti nt_nifti_file_read(char* filepath)
     NtNifti nifti;
     nifti.header = (NtNiftiHeader*)data;
     nifti.voxel_type = header.datatype;
-    // @todo: Need to fix this. Can't free this data!
     nifti.voxel_data = (void*)(data + (size_t)header.vox_offset);
     nifti.dim = header.dim[0];
     nifti.shape = (size_t*) malloc(nifti.dim * sizeof(*nifti.shape));
