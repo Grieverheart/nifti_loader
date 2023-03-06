@@ -329,7 +329,7 @@ inline static uint16_t nti__bt_match(NtiBinaryTree* bt, uint16_t code, uint8_t* 
 inline static NtiBinaryTree nti__deflate_build_code_tree(uint8_t* code_lengths, size_t num_codes)
 {
     size_t max_code = 0;
-    uint16_t* bl_count = (uint16_t*)calloc(16+1, 1);
+    uint16_t* bl_count = (uint16_t*)calloc(16+1, sizeof(uint16_t));
     for(size_t code = 0; code < num_codes; ++code)
     {
         uint8_t code_length = code_lengths[code];
