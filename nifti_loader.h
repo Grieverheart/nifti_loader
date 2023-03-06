@@ -3,6 +3,11 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <math.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #pragma pack(push, 1)
 typedef struct
@@ -86,8 +91,12 @@ typedef struct
     float          affine[4*4];
 } NtNifti;
 
-extern NtNifti nt_nifti_file_read(char* filepath);
+extern NtNifti nt_nifti_file_read(const char* filepath);
 extern void nt_nifti_free(NtNifti* nifti);
+
+#ifdef __cplusplus
+}
+#endif
 
 #ifdef NT_NIFTI_LOADER_IMPLEMENTATION
 
@@ -184,6 +193,7 @@ typedef struct
 
 inline static void nti__deflate_eat_bits(NtiDeflateState* state, uint8_t nbits)
 {
+    // @todo: Improve!
     state->bit_id += nbits;
     while(state->bit_id >= 8)
     {
@@ -215,6 +225,15 @@ inline static void nti__deflate_peek_bytes(const NtiDeflateState* state, uint8_t
             if(state->byte_id + bi == state->size) break;
             bytes[bi] = state->data[state->byte_id + bi];
         }
+    }
+}
+
+inline static void nti__deflate_skip_byte(NtiDeflateState* state)
+{
+    if(state->bit_id > 0)
+    {
+        state->bit_id = 0;
+        ++state->byte_id;
     }
 }
 
@@ -310,7 +329,7 @@ inline static uint16_t nti__bt_match(NtiBinaryTree* bt, uint16_t code, uint8_t* 
 inline static NtiBinaryTree nti__deflate_build_code_tree(uint8_t* code_lengths, size_t num_codes)
 {
     size_t max_code = 0;
-    uint8_t* bl_count = (uint8_t*)calloc(16+1, 1);
+    uint16_t* bl_count = (uint16_t*)calloc(16+1, 1);
     for(size_t code = 0; code < num_codes; ++code)
     {
         uint8_t code_length = code_lengths[code];
@@ -472,6 +491,10 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
         12, 12, 13, 13
     };
 
+    NtiBinaryTree btlit_fixed, btdist_fixed;
+    btlit_fixed.data  = NULL;
+    btdist_fixed.data = NULL;
+
     NtiBuffer data_buffer;
     nti__buffer_init(&data_buffer, size);
 
@@ -487,16 +510,21 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
         uint8_t btype  = (header >> 1) & 3;
         if(btype == 0)
         {
-            printf("No compression not supported yet.\n");
-            NTIW_ASSERT(false);
-        }
-        else if(btype == 3)
-        {
-            printf("Static Huffman tables not supported yet.\n");
-            NTIW_ASSERT(false);
+            nti__deflate_skip_byte(&state);
+
+            const uint8_t* bytes = state.data + state.byte_id;
+            uint16_t len  = *(uint16_t*) bytes;
+            uint16_t nlen = *(uint16_t*) (bytes + 2);
+            if(len)
+                nti__buffer_append_v(&data_buffer, bytes + 4, len);
+            state.byte_id += 4 + len;
+            NTIW_ASSERT(nlen == (len ^ (uint16_t)(-1)));
         }
         else
         {
+            NTIW_ASSERT(btype != 3);
+
+            NtiBinaryTree btlit, btdist;
             if(btype == 2)
             {
                 uint8_t hlit  = nti__deflate_read_nbits8(&state, 5);
@@ -576,72 +604,95 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                 }
                 nti__bt_free(&bt);
 
-                NtiBinaryTree btlit  = nti__deflate_build_code_tree(alphabet_code_lengths, hlit+257u);
-                NtiBinaryTree btdist = nti__deflate_build_code_tree(alphabet_code_lengths+hlit+257u, hdist+1u);
+                btlit  = nti__deflate_build_code_tree(alphabet_code_lengths, hlit+257u);
+                btdist = nti__deflate_build_code_tree(alphabet_code_lengths+hlit+257u, hdist+1u);
                 free(alphabet_code_lengths);
-
-                while(true)
-                {
-                    uint8_t bytes[2];
-                    nti__deflate_peek_bytes(&state, bytes, 2);
-                    uint8_t match_length = 0;
-                    uint16_t letter = nti__bt_match(&btlit, *(uint16_t*)bytes, &match_length);
-                    NTIW_ASSERT(letter < (uint16_t)(-2));
-                    nti__deflate_eat_bits(&state, match_length);
-
-                    if(letter == 256u)
-                        break;
-                    else if(letter < 256u)
-                        nti__buffer_append(&data_buffer, letter);
-                    else
-                    {
-                        letter -= 257u;
-                        uint16_t base = length_code_length_base[letter];
-                        uint16_t num_extra_bits = length_code_extra_bits[letter];
-                        uint16_t length = base + (uint16_t)nti__deflate_read_nbits8(&state, num_extra_bits);
-
-                        nti__deflate_peek_bytes(&state, bytes, 2);
-                        uint8_t match_length = 0;
-                        uint16_t letter = nti__bt_match(&btdist, *(uint16_t*)bytes, &match_length);
-                        NTIW_ASSERT(letter < (uint16_t)(-2));
-                        nti__deflate_eat_bits(&state, match_length);
-
-                        base = dist_code_dist_base[letter];
-                        num_extra_bits = dist_code_extra_bits[letter];
-                        uint16_t dist = base + nti__deflate_read_nbits16(&state, num_extra_bits);
-                        // @note: Slower
-                        //size_t pos = data_buffer.count - dist;
-                        //for(size_t i = 0; i < length; ++i)
-                        //    nti__buffer_append(&data_buffer, data_buffer.data[pos + i % dist]);
-
-                        nti__buffer_maybe_resize(&data_buffer, length);
-                        const uint8_t* data_lookback = data_buffer.data + data_buffer.count - dist;
-                        if(length < dist)
-                            nti__buffer_append_v(&data_buffer, data_lookback, length);
-                        else
-                        {
-                            size_t l = length;
-                            while(l >= dist)
-                            {
-                                nti__buffer_append_v(&data_buffer, data_lookback, dist);
-                                l -= dist;
-                            }
-                            if(l > 0) nti__buffer_append_v(&data_buffer, data_lookback, l);
-                        }
-                    }
-
-                }
-
-                nti__bt_free(&btlit);
-                nti__bt_free(&btdist);
             }
             else
             {
-                NTIW_ASSERT(false);
+                if(!btlit_fixed.data)
+                {
+                    uint8_t alphabet_code_lengths[288+32];
+                    memset(alphabet_code_lengths, 8, 144);
+                    memset(alphabet_code_lengths+144, 9, 112);
+                    memset(alphabet_code_lengths+256, 7, 24);
+                    memset(alphabet_code_lengths+280, 8, 8);
+                    memset(alphabet_code_lengths+288, 5, 32);
+                    btlit_fixed  = nti__deflate_build_code_tree(alphabet_code_lengths, 288u);
+                    btdist_fixed = nti__deflate_build_code_tree(alphabet_code_lengths+288u, 32u);
+                }
+
+                btlit  = btlit_fixed;
+                btdist = btdist_fixed;
+            }
+
+            while(true)
+            {
+                uint8_t bytes[2];
+                nti__deflate_peek_bytes(&state, bytes, 2);
+                uint8_t match_length = 0;
+                uint16_t letter = nti__bt_match(&btlit, *(uint16_t*)bytes, &match_length);
+                NTIW_ASSERT(letter < (uint16_t)(-2));
+                nti__deflate_eat_bits(&state, match_length);
+
+                if(letter == 256u)
+                    break;
+                else if(letter < 256u)
+                    nti__buffer_append(&data_buffer, letter);
+                else
+                {
+                    letter -= 257u;
+                    uint16_t base = length_code_length_base[letter];
+                    uint16_t num_extra_bits = length_code_extra_bits[letter];
+                    uint16_t length = base + (uint16_t)nti__deflate_read_nbits8(&state, num_extra_bits);
+
+                    nti__deflate_peek_bytes(&state, bytes, 2);
+                    uint8_t match_length = 0;
+                    uint16_t letter = nti__bt_match(&btdist, *(uint16_t*)bytes, &match_length);
+                    NTIW_ASSERT(letter < 30);
+                    nti__deflate_eat_bits(&state, match_length);
+
+                    base = dist_code_dist_base[letter];
+                    num_extra_bits = dist_code_extra_bits[letter];
+                    uint16_t dist = base + nti__deflate_read_nbits16(&state, num_extra_bits);
+                    NTIW_ASSERT(data_buffer.count >= dist);
+                    // @note: Slower
+                    //size_t pos = data_buffer.count - dist;
+                    //for(size_t i = 0; i < length; ++i)
+                    //    nti__buffer_append(&data_buffer, data_buffer.data[pos + i % dist]);
+
+
+                    nti__buffer_maybe_resize(&data_buffer, length);
+                    const uint8_t* data_lookback = data_buffer.data + data_buffer.count - dist;
+                    if(length < dist)
+                        nti__buffer_append_v(&data_buffer, data_lookback, length);
+                    else
+                    {
+                        size_t l = length;
+                        while(l >= dist)
+                        {
+                            nti__buffer_append_v(&data_buffer, data_lookback, dist);
+                            l -= dist;
+                        }
+                        if(l > 0) nti__buffer_append_v(&data_buffer, data_lookback, l);
+                    }
+                }
+            }
+
+            if(btype == 2)
+            {
+                nti__bt_free(&btlit);
+                nti__bt_free(&btdist);
             }
         }
 
         if(bfinal) break;
+    }
+
+    if(btlit_fixed.data)
+    {
+        nti__bt_free(&btlit_fixed);
+        nti__bt_free(&btdist_fixed);
     }
 
     nti__buffer_compact(&data_buffer);
@@ -659,10 +710,61 @@ static uint8_t* nti__read_gzip(FILE* fp, size_t* data_size)
 
     NtiGzipHeader header;
     fread(&header, sizeof(NtiGzipHeader), 1, fp);
+    if(*(uint16_t*)header.magic != 0x8b1f)
+    {
+        fseek(fp, 0, SEEK_SET);
+        return NULL;
+    }
 
-    // @todo: Optional headers
+    if(header.file_flags & GZ_FEXTRA)
+    {
+        NTIW_ASSERT(false);
+        // @todo: implement
+        //uint16_t xlen;
+        //fread(&xlen, 2, 1, fp);
+    }
 
-    size_t cdata_size = file_size - 10 - 8;
+
+    if(header.file_flags & GZ_FNAME)
+    {
+        //NtiBuffer buffer;
+        //nti__buffer_init(&buffer, 64);
+        while(true)
+        {
+            uint8_t byte = 0;
+            fread(&byte, 1, 1, fp);
+            //nti__buffer_append(&buffer, byte);
+            if(byte == 0) break;
+        }
+        //nti__buffer_compact(&buffer);
+        //free(buffer.data);
+    }
+
+    if(header.file_flags & GZ_FCOMMENT)
+    {
+        //NtiBuffer buffer;
+        //nti__buffer_init(&buffer, 64);
+        while(true)
+        {
+            uint8_t byte = 0;
+            fread(&byte, 1, 1, fp);
+            //nti__buffer_append(&buffer, byte);
+            if(byte == 0) break;
+        }
+        //nti__buffer_compact(&buffer);
+        //free(buffer.data);
+    }
+
+    if(header.file_flags & GZ_FHCRC)
+    {
+        // @todo: implement
+        NTIW_ASSERT(false);
+    }
+
+    //nti__print_gzip_header(header);
+
+    size_t read_bytes = ftell(fp);
+    size_t cdata_size = file_size - read_bytes - 8;
     uint8_t* cdata = (uint8_t*) malloc(cdata_size);
     fread(cdata, cdata_size, 1, fp);
     uint32_t crc32, deflated_data_size;
@@ -735,28 +837,86 @@ void nt_nifti_free(NtNifti* nifti)
     free(nifti->shape);
 }
 
-NtNifti nt_nifti_file_read(char* filepath)
+NtNifti nt_nifti_file_read(const char* filepath)
 {
     FILE* fp = fopen(filepath, "rb");
-    size_t data_size = 0;
-    uint8_t* data = nti__read_gzip(fp, &data_size);
+
+    int magic;
+    fread(&magic, 1, 4, fp);
+    fseek(fp, 0, SEEK_SET);
+
+    size_t data_size;
+    uint8_t* data;
+    if((magic & 0xFFFF) == 0x8b1f)
+    {
+        data_size = 0;
+        data = nti__read_gzip(fp, &data_size);
+    }
+    else if(magic == 348)
+    {
+        fseek(fp, 0, SEEK_END);
+        size_t file_size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+
+        data = (uint8_t*) malloc(file_size);
+        fread(data, 1, file_size, fp);
+    }
+    else
+        NTIW_ASSERT(false);
+
     fclose(fp);
 
     NtNiftiHeader header = *(NtNiftiHeader*)data;
+    //nti__print_nifti_header(header);
 
     NTIW_ASSERT(header.sizeof_hdr == 348);
-    NTIW_ASSERT(header.sform_code == 1);
+    //NTIW_ASSERT(header.qform_code == 1);
+    //NTIW_ASSERT(header.sform_code == 1);
     NtNifti nifti;
     nifti.header = (NtNiftiHeader*)data;
     nifti.voxel_type = header.datatype;
+    // @todo: Is the offset correct?
     nifti.voxel_data = (void*)(data + (size_t)header.vox_offset);
     nifti.dim = header.dim[0];
     nifti.shape = (size_t*) malloc(nifti.dim * sizeof(*nifti.shape));
     for(size_t i = 0; i < nifti.dim; ++i)
         nifti.shape[i] = header.dim[i+1];
-    memcpy(nifti.affine, header.srow_x, 4 * sizeof(float));
-    memcpy(nifti.affine + 4, header.srow_y, 4 * sizeof(float));
-    memcpy(nifti.affine + 8, header.srow_z, 4 * sizeof(float));
+
+    if(header.sform_code > 0)
+    {
+        memcpy(nifti.affine, header.srow_x, 4 * sizeof(float));
+        memcpy(nifti.affine + 4, header.srow_y, 4 * sizeof(float));
+        memcpy(nifti.affine + 8, header.srow_z, 4 * sizeof(float));
+    }
+    else if(header.qform_code > 0)
+    {
+        float b = header.quatern_b;
+        float c = header.quatern_c;
+        float d = header.quatern_d;
+        float a = sqrt(1.0 - b*b - c*c - d*d);
+        nifti.affine[0]  = a*a+b*b-c*c-d*d;
+        nifti.affine[1]  = 2*(b*c-a*d);
+        nifti.affine[2]  = 2*(b*d+a*c);
+        nifti.affine[3]  = header.qoffset_x;
+        nifti.affine[4]  = 2*(b*c+a*d);
+        nifti.affine[5]  = a*a+c*c-b*b-d*d;
+        nifti.affine[6]  = 2*(c*d-a*b);
+        nifti.affine[7]  = header.qoffset_y;
+        nifti.affine[8]  = 2*(b*d-a*c);
+        nifti.affine[9]  = 2*(c*d+a*b);
+        nifti.affine[10] = a*a+d*d-b*b-c*c;
+        nifti.affine[11] = header.qoffset_z;
+
+        for(size_t i = 0; i < 3; ++i)
+            for(size_t j = 0; j < 3; ++j)
+                nifti.affine[4*j+i] *= header.pixdim[1+i];
+    }
+    else
+    {
+        // @todo
+        NTIW_ASSERT(false);
+    }
+
     nifti.affine[12] = 0.0;
     nifti.affine[13] = 0.0;
     nifti.affine[14] = 0.0;
@@ -852,4 +1012,5 @@ uint32_t nti__crc32(const uint8_t data[], size_t data_length) {
 }
 
 #endif
+
 #endif
