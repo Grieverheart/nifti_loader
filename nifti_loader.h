@@ -104,6 +104,7 @@ extern void nt_nifti_free(NtNifti* nifti);
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include "libdeflate.h"
 
 #pragma pack(push, 1)
 typedef struct
@@ -771,11 +772,21 @@ static uint8_t* nti__read_gzip(FILE* fp, size_t* data_size)
     fread(&crc32, 4, 1, fp);
     fread(&deflated_data_size, 4, 1, fp);
 
-    uint8_t* data = nti__inflate(cdata, cdata_size, data_size);
-    free(cdata);
-    uint32_t read_crc32 = nti__crc32(data, *data_size);
+    struct libdeflate_decompressor* decompressor =
+        libdeflate_alloc_decompressor();
 
-    NTIW_ASSERT(read_crc32 == crc32);
+    uint8_t* data = malloc(deflated_data_size);
+    enum libdeflate_result result =
+    libdeflate_deflate_decompress(
+        decompressor,
+        (void*) cdata, cdata_size,
+        (void*) data, deflated_data_size,
+        NULL
+    );
+
+    NTIW_ASSERT(result == LIBDEFLATE_SUCCESS);
+
+    libdeflate_free_decompressor(decompressor);
 
     return data;
 }
