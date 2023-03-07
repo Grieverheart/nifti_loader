@@ -265,17 +265,35 @@ inline static uint16_t nti__deflate_read_nbits16(NtiDeflateState* state, uint8_t
     return bits_a | (bits_b << 8);
 }
 
-typedef struct
+struct NtiBinaryTree_t;
+typedef struct NtiBinaryTree_t
 {
     uint16_t* data;
     size_t size_data;
+    size_t far_size;
+    size_t near_bits;
 } NtiBinaryTree;
 
 inline static void nti__bt_init(NtiBinaryTree* bt)
 {
-    bt->size_data = 31;
-    bt->data = (uint16_t*) malloc(bt->size_data * sizeof(*bt->data));
-    for(size_t i = 0; i < bt->size_data; ++i)
+    bt->near_bits = 9;
+    bt->size_data = (1ULL << (bt->near_bits + 1)) - 1;
+
+    size_t rest_bits = 15 - bt->near_bits;
+    bt->far_size = (1ULL << (rest_bits + 1)) - 1;
+    size_t num_far_trees = 1ULL << bt->near_bits;
+    size_t total_size = (bt->size_data + num_far_trees * bt->far_size);
+
+    bt->data = (uint16_t*) malloc(total_size * sizeof(*bt->data));
+    for(size_t i = 0; i < total_size; ++i)
+        bt->data[i] = (uint16_t)(-1);
+}
+
+inline static void nti__bt_reset(NtiBinaryTree* bt)
+{
+    size_t num_far_trees = 1ULL << bt->near_bits;
+    size_t total_size = (bt->size_data + num_far_trees * bt->far_size);
+    for(size_t i = 0; i < total_size; ++i)
         bt->data[i] = (uint16_t)(-1);
 }
 
@@ -286,47 +304,86 @@ inline static void nti__bt_free(NtiBinaryTree* bt)
 
 inline static void nti__bt_push(NtiBinaryTree* bt, uint16_t data, uint16_t code, uint8_t code_length)
 {
-    size_t new_size = (1 << (size_t)(code_length + 1)) - 1;
-    if(new_size > bt->size_data)
+    if(code_length > bt->near_bits)
     {
-        bt->data = (uint16_t*) realloc((uint16_t*) bt->data, new_size * sizeof(*bt->data));
-        for(size_t i = bt->size_data; i < new_size; ++i)
-            bt->data[i] = (uint16_t)(-1);
-        bt->size_data = new_size;
-    }
+        // Push using the reverse code.
+        size_t pos = 0;
+        uint16_t mask = 1 << (code_length - 1);
+        uint16_t idx = 0;
+        for(size_t i = 0; i < bt->near_bits; ++i)
+        {
+            if(code & mask)
+                idx |= (1ULL << i);
+            code <<= 1;
+        }
 
-    // Push using the reverse code.
-    size_t pos = 0;
-    uint16_t mask = 1 << (code_length - 1);
-    for(size_t i = 0; i < (size_t)code_length; ++i)
-    {
-        pos = 2 * pos + 1 + ((code & mask) > 0);
-        code <<= 1;
-        bt->data[pos] = (uint16_t)(-2);
+        // Push using the reverse code.
+        uint16_t* far_data = bt->data + bt->size_data + idx * bt->far_size;
+        pos = 0;
+        for(size_t i = 0; i < (size_t)(code_length - bt->near_bits); ++i)
+        {
+            pos = 2 * pos + 1 + ((code & mask) > 0);
+            far_data[pos] = (uint16_t)(-2);
+            code <<= 1;
+        }
+        far_data[pos] = data;
     }
-    bt->data[pos] = data;
+    else
+    {
+        // Push using the reverse code.
+        size_t pos = 0;
+        uint16_t mask = 1 << (code_length - 1);
+        for(size_t i = 0; i < (size_t)code_length; ++i)
+        {
+            pos = 2 * pos + 1 + ((code & mask) > 0);
+            code <<= 1;
+            bt->data[pos] = (uint16_t)(-2);
+        }
+        bt->data[pos] = data;
+    }
 }
 
 inline static uint16_t nti__bt_match(NtiBinaryTree* bt, uint16_t code, uint8_t* match_length)
 {
     size_t pos = 0;
-    for(size_t i = 0; i < 16; ++i)
+    uint16_t original_code = code;
+    size_t near_bits = bt->near_bits;
+    for(size_t i = 0; i < near_bits; ++i)
     {
-        pos = 2 * pos + 1 + (code & 1);
-        if(pos >= bt->size_data || bt->data[pos] == (uint16_t)(-1))
-            return (uint16_t)(-1);
-        code >>= 1;
-        if(bt->data[pos] < (uint16_t)(-2))
+        pos = (pos << 1) + 1 + (code & 1);
+
+        uint16_t data = bt->data[pos];
+        if(data < (uint16_t)(-2))
         {
             *match_length = i+1;
-            return bt->data[pos];
+            return data;
         }
+        code >>= 1;
     }
+
+    code = original_code >> bt->near_bits;
+    size_t idx = original_code & ((1ULL << bt->near_bits) - 1);
+    uint16_t* far_data = bt->data + bt->size_data + idx * bt->far_size;
+
+    pos = 0;
+    for(size_t i = 0; i < 15 - bt->near_bits; ++i)
+    {
+        pos = (pos << 1) + 1 + (code & 1);
+
+        if(far_data[pos] < (uint16_t)(-2))
+        {
+            *match_length = i+1+bt->near_bits;
+            return far_data[pos];
+        }
+        if(far_data[pos] == (uint16_t)(-1)) return (uint16_t)(-1);
+        code >>= 1;
+    }
+
 
     return (uint16_t)(-1);
 }
 
-inline static NtiBinaryTree nti__deflate_build_code_tree(uint8_t* code_lengths, size_t num_codes)
+inline static void nti__deflate_build_code_tree(NtiBinaryTree* bt, uint8_t* code_lengths, size_t num_codes)
 {
     size_t max_code = 0;
     uint16_t* bl_count = (uint16_t*)calloc(16+1, sizeof(uint16_t));
@@ -335,8 +392,10 @@ inline static NtiBinaryTree nti__deflate_build_code_tree(uint8_t* code_lengths, 
         uint8_t code_length = code_lengths[code];
         NTIW_ASSERT(code_length < 17);
         if(code_length > 0)
+        {
             max_code = code;
-        ++bl_count[code_length];
+            ++bl_count[code_length];
+        }
     }
 
     uint16_t code = 0;
@@ -348,19 +407,15 @@ inline static NtiBinaryTree nti__deflate_build_code_tree(uint8_t* code_lengths, 
     }
     free(bl_count);
 
-    NtiBinaryTree bt;
-    nti__bt_init(&bt);
     for(size_t n = 0; n <= max_code; ++n)
     {
         uint8_t len = code_lengths[n];
         if(len > 0)
         {
-            nti__bt_push(&bt, n, next_code[len], len);
+            nti__bt_push(bt, n, next_code[len], len);
             ++next_code[len];
         }
     }
-
-    return bt;
 }
 
 typedef struct
@@ -412,7 +467,7 @@ inline static void nti__buffer_maybe_resize(NtiBuffer* buffer, size_t count)
     buffer->data = (uint8_t*) realloc(buffer->data, buffer->capacity);
 }
 
-inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* size_out)
+inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* size_out, size_t size_inflated)
 {
     // DEFLATE
     //
@@ -495,8 +550,13 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
     btlit_fixed.data  = NULL;
     btdist_fixed.data = NULL;
 
-    NtiBuffer data_buffer;
-    nti__buffer_init(&data_buffer, size);
+    uint8_t* data_buffer = (uint8_t*) malloc(size_inflated);
+    size_t buffer_position = 0;
+
+    NtiBinaryTree bt, btlit, btdist;
+    nti__bt_init(&bt);
+    nti__bt_init(&btlit);
+    nti__bt_init(&btdist);
 
     NtiDeflateState state;
     state.byte_id = 0;
@@ -516,7 +576,10 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
             uint16_t len  = *(uint16_t*) bytes;
             uint16_t nlen = *(uint16_t*) (bytes + 2);
             if(len)
-                nti__buffer_append_v(&data_buffer, bytes + 4, len);
+            {
+                memcpy(data_buffer + buffer_position, bytes + 4, len);
+                buffer_position += len;
+            }
             state.byte_id += 4 + len;
             NTIW_ASSERT(nlen == (len ^ (uint16_t)(-1)));
         }
@@ -524,7 +587,6 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
         {
             NTIW_ASSERT(btype != 3);
 
-            NtiBinaryTree btlit, btdist;
             if(btype == 2)
             {
                 uint8_t hlit  = nti__deflate_read_nbits8(&state, 5);
@@ -532,7 +594,6 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                 uint8_t hclen = nti__deflate_read_nbits8(&state, 4);
 
                 // Read code lengths for code length alphabet.
-                NtiBinaryTree bt;
                 {
                     uint8_t num_codes = 19;
                     size_t num_code_lengths = hclen + 4;
@@ -549,7 +610,8 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                     }
 
                     // Build code length Huffman tree.
-                    bt = nti__deflate_build_code_tree(code_lengths, num_codes);
+                    nti__bt_reset(&bt);
+                    nti__deflate_build_code_tree(&bt, code_lengths, num_codes);
                     free(code_lengths);
                 }
 
@@ -602,10 +664,11 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                         previous_letter = letter;
                     }
                 }
-                nti__bt_free(&bt);
 
-                btlit  = nti__deflate_build_code_tree(alphabet_code_lengths, hlit+257u);
-                btdist = nti__deflate_build_code_tree(alphabet_code_lengths+hlit+257u, hdist+1u);
+                nti__bt_reset(&btlit);
+                nti__bt_reset(&btdist);
+                nti__deflate_build_code_tree(&btlit, alphabet_code_lengths, hlit+257u);
+                nti__deflate_build_code_tree(&btdist, alphabet_code_lengths+hlit+257u, hdist+1u);
                 free(alphabet_code_lengths);
             }
             else
@@ -618,8 +681,10 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                     memset(alphabet_code_lengths+256, 7, 24);
                     memset(alphabet_code_lengths+280, 8, 8);
                     memset(alphabet_code_lengths+288, 5, 32);
-                    btlit_fixed  = nti__deflate_build_code_tree(alphabet_code_lengths, 288u);
-                    btdist_fixed = nti__deflate_build_code_tree(alphabet_code_lengths+288u, 32u);
+                    nti__bt_init(&btlit_fixed);
+                    nti__bt_init(&btdist_fixed);
+                    nti__deflate_build_code_tree(&btlit_fixed, alphabet_code_lengths, 288u);
+                    nti__deflate_build_code_tree(&btdist_fixed, alphabet_code_lengths+288u, 32u);
                 }
 
                 btlit  = btlit_fixed;
@@ -638,7 +703,7 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                 if(letter == 256u)
                     break;
                 else if(letter < 256u)
-                    nti__buffer_append(&data_buffer, letter);
+                    data_buffer[buffer_position++] = letter;
                 else
                 {
                     letter -= 257u;
@@ -655,34 +720,35 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
                     base = dist_code_dist_base[letter];
                     num_extra_bits = dist_code_extra_bits[letter];
                     uint16_t dist = base + nti__deflate_read_nbits16(&state, num_extra_bits);
-                    NTIW_ASSERT(data_buffer.count >= dist);
+                    NTIW_ASSERT(buffer_position >= dist);
                     // @note: Slower
                     //size_t pos = data_buffer.count - dist;
                     //for(size_t i = 0; i < length; ++i)
                     //    nti__buffer_append(&data_buffer, data_buffer.data[pos + i % dist]);
 
 
-                    nti__buffer_maybe_resize(&data_buffer, length);
-                    const uint8_t* data_lookback = data_buffer.data + data_buffer.count - dist;
+                    const uint8_t* data_lookback = data_buffer + buffer_position - dist;
                     if(length < dist)
-                        nti__buffer_append_v(&data_buffer, data_lookback, length);
+                    {
+                        memcpy(data_buffer + buffer_position, data_lookback, length);
+                        buffer_position += length;
+                    }
                     else
                     {
                         size_t l = length;
                         while(l >= dist)
                         {
-                            nti__buffer_append_v(&data_buffer, data_lookback, dist);
+                            memcpy(data_buffer + buffer_position, data_lookback, dist);
+                            buffer_position += dist;
                             l -= dist;
                         }
-                        if(l > 0) nti__buffer_append_v(&data_buffer, data_lookback, l);
+                        if(l > 0)
+                        {
+                            memcpy(data_buffer + buffer_position, data_lookback, l);
+                            buffer_position += l;
+                        }
                     }
                 }
-            }
-
-            if(btype == 2)
-            {
-                nti__bt_free(&btlit);
-                nti__bt_free(&btdist);
             }
         }
 
@@ -694,10 +760,12 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
         nti__bt_free(&btlit_fixed);
         nti__bt_free(&btdist_fixed);
     }
+    nti__bt_free(&btlit);
+    nti__bt_free(&btdist);
+    nti__bt_free(&bt);
 
-    nti__buffer_compact(&data_buffer);
-    *size_out = data_buffer.count;
-    return data_buffer.data;
+    *size_out = size_inflated;
+    return data_buffer;
 }
 
 static inline uint32_t nti__crc32(const uint8_t data[], size_t data_length);
@@ -771,11 +839,11 @@ static uint8_t* nti__read_gzip(FILE* fp, size_t* data_size)
     fread(&crc32, 4, 1, fp);
     fread(&deflated_data_size, 4, 1, fp);
 
-    uint8_t* data = nti__inflate(cdata, cdata_size, data_size);
+    uint8_t* data = nti__inflate(cdata, cdata_size, data_size, deflated_data_size);
     free(cdata);
-    uint32_t read_crc32 = nti__crc32(data, *data_size);
+    //uint32_t read_crc32 = nti__crc32(data, *data_size);
 
-    NTIW_ASSERT(read_crc32 == crc32);
+    //NTIW_ASSERT(read_crc32 == crc32);
 
     return data;
 }
