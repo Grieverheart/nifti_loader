@@ -265,33 +265,40 @@ inline static uint16_t nti__deflate_read_nbits16(NtiDeflateState* state, uint8_t
     return bits_a | (bits_b << 8);
 }
 
+#define __NTI_NB 7
+#define BITMASK(x) ((1ULL << (x)) - 1)
+
 struct NtiBinaryTree_t;
 typedef struct NtiBinaryTree_t
 {
     uint16_t* data;
+    uint8_t* lens;
     size_t size_data;
     size_t far_size;
-    size_t near_bits;
 } NtiBinaryTree;
 
+// @todo: Instead of far trees, create subtables. The first __NTI_NB bits of
+// the code when indexed in the root table, will point to the subtable.
+// Building the subtables so that they can be accessed efficiently is a bit
+// tricky; look into libdeflate, specifically in build_decode_table.
 inline static void nti__bt_init(NtiBinaryTree* bt)
 {
-    bt->near_bits = 9;
-    bt->size_data = (1ULL << (bt->near_bits + 1)) - 1;
+    bt->size_data = 1ULL << __NTI_NB;
 
-    size_t rest_bits = 15 - bt->near_bits;
+    size_t rest_bits = 15 - __NTI_NB;
     bt->far_size = (1ULL << (rest_bits + 1)) - 1;
-    size_t num_far_trees = 1ULL << bt->near_bits;
+    size_t num_far_trees = 1ULL << __NTI_NB;
     size_t total_size = (bt->size_data + num_far_trees * bt->far_size);
 
     bt->data = (uint16_t*) malloc(total_size * sizeof(*bt->data));
+    bt->lens = (uint8_t*) malloc(bt->size_data * sizeof(*bt->lens));
     for(size_t i = 0; i < total_size; ++i)
         bt->data[i] = (uint16_t)(-1);
 }
 
 inline static void nti__bt_reset(NtiBinaryTree* bt)
 {
-    size_t num_far_trees = 1ULL << bt->near_bits;
+    size_t num_far_trees = 1ULL << __NTI_NB;
     size_t total_size = (bt->size_data + num_far_trees * bt->far_size);
     for(size_t i = 0; i < total_size; ++i)
         bt->data[i] = (uint16_t)(-1);
@@ -300,17 +307,18 @@ inline static void nti__bt_reset(NtiBinaryTree* bt)
 inline static void nti__bt_free(NtiBinaryTree* bt)
 {
     free(bt->data);
+    free(bt->lens);
 }
 
 inline static void nti__bt_push(NtiBinaryTree* bt, uint16_t data, uint16_t code, uint8_t code_length)
 {
-    if(code_length > bt->near_bits)
+    if(code_length > __NTI_NB)
     {
         // Push using the reverse code.
         size_t pos = 0;
         uint16_t mask = 1 << (code_length - 1);
         uint16_t idx = 0;
-        for(size_t i = 0; i < bt->near_bits; ++i)
+        for(size_t i = 0; i < __NTI_NB; ++i)
         {
             if(code & mask)
                 idx |= (1ULL << i);
@@ -320,7 +328,7 @@ inline static void nti__bt_push(NtiBinaryTree* bt, uint16_t data, uint16_t code,
         // Push using the reverse code.
         uint16_t* far_data = bt->data + bt->size_data + idx * bt->far_size;
         pos = 0;
-        for(size_t i = 0; i < (size_t)(code_length - bt->near_bits); ++i)
+        for(size_t i = 0; i < (size_t)(code_length - __NTI_NB); ++i)
         {
             pos = 2 * pos + 1 + ((code & mask) > 0);
             far_data[pos] = (uint16_t)(-2);
@@ -331,48 +339,49 @@ inline static void nti__bt_push(NtiBinaryTree* bt, uint16_t data, uint16_t code,
     else
     {
         // Push using the reverse code.
-        size_t pos = 0;
-        uint16_t mask = 1 << (code_length - 1);
+        uint16_t rcode = 0;
+        uint16_t mask = 1ULL << (code_length - 1);
         for(size_t i = 0; i < (size_t)code_length; ++i)
         {
-            pos = 2 * pos + 1 + ((code & mask) > 0);
+            if(code & mask)
+                rcode |= (1 << i);
             code <<= 1;
-            bt->data[pos] = (uint16_t)(-2);
         }
-        bt->data[pos] = data;
+
+        //printf("___ 0x%x, %u\n", rcode, code_length);
+        mask = (1ULL << code_length) - 1;
+        for(uint16_t i = 0; i < bt->size_data; ++i)
+        {
+            if((i & mask) == rcode)
+            {
+                bt->data[i] = data;
+                bt->lens[i] = code_length;
+            }
+        }
     }
 }
 
 inline static uint16_t nti__bt_match(NtiBinaryTree* bt, uint16_t code, uint8_t* match_length)
 {
-    size_t pos = 0;
-    uint16_t original_code = code;
-    size_t near_bits = bt->near_bits;
-    for(size_t i = 0; i < near_bits; ++i)
+    uint16_t data = bt->data[code & BITMASK(__NTI_NB)];
+    if(data < (uint16_t)(-1))
     {
-        pos = (pos << 1) + 1 + (code & 1);
-
-        uint16_t data = bt->data[pos];
-        if(data < (uint16_t)(-2))
-        {
-            *match_length = i+1;
-            return data;
-        }
-        code >>= 1;
+        *match_length = bt->lens[code & BITMASK(__NTI_NB)];
+        return data;
     }
 
-    code = original_code >> bt->near_bits;
-    size_t idx = original_code & ((1ULL << bt->near_bits) - 1);
+    size_t idx = code & BITMASK(__NTI_NB);
+    code = code >> __NTI_NB;
     uint16_t* far_data = bt->data + bt->size_data + idx * bt->far_size;
 
-    pos = 0;
-    for(size_t i = 0; i < 15 - bt->near_bits; ++i)
+    size_t pos = 0;
+    for(size_t i = 0; i < 15 - __NTI_NB; ++i)
     {
         pos = (pos << 1) + 1 + (code & 1);
 
         if(far_data[pos] < (uint16_t)(-2))
         {
-            *match_length = i+1+bt->near_bits;
+            *match_length = i+1+__NTI_NB;
             return far_data[pos];
         }
         if(far_data[pos] == (uint16_t)(-1)) return (uint16_t)(-1);
@@ -549,6 +558,8 @@ inline static uint8_t* nti__inflate(const uint8_t* data, size_t size, size_t* si
     NtiBinaryTree btlit_fixed, btdist_fixed;
     btlit_fixed.data  = NULL;
     btdist_fixed.data = NULL;
+    btlit_fixed.lens  = NULL;
+    btdist_fixed.lens = NULL;
 
     uint8_t* data_buffer = (uint8_t*) malloc(size_inflated);
     size_t buffer_position = 0;
